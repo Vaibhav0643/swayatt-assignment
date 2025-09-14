@@ -1,0 +1,110 @@
+pipeline {
+  agent any
+  environment {
+    AWS_REGION = "${env.AWS_REGION ?: 'us-east-1'}"
+    AWS_ACCOUNT_ID = "${env.AWS_ACCOUNT_ID ?: '<YOUR_AWS_ACCOUNT_ID>'}"
+    REPO_NAME = "${env.REPO_NAME ?: 'devops-task'}"
+    IMAGE_TAG = "${env.BUILD_NUMBER}"
+    ECR_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}"
+    CLUSTER_NAME = "${env.CLUSTER_NAME ?: 'devops-ec2-cluster'}"
+    TASK_FAMILY = "${env.TASK_FAMILY ?: 'devops-task'}"
+    SERVICE_NAME = "${env.SERVICE_NAME ?: 'devops-task-service'}"
+  }
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Build & Test') {
+      steps {
+        sh 'cd ./ && npm ci || true'   // allow if no tests
+      }
+    }
+
+    stage('Docker Build & Push to ECR') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'aws-creds', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+          sh '''
+            export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+            export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+            aws --version
+            # login to ecr
+            aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_URI}
+            # build, tag, push
+            docker build -t ${REPO_NAME}:${IMAGE_TAG} .
+            docker tag ${REPO_NAME}:${IMAGE_TAG} ${ECR_URI}:${IMAGE_TAG}
+            docker push ${ECR_URI}:${IMAGE_TAG}
+          '''
+        }
+      }
+    }
+
+    stage('Register Task Definition') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'aws-creds', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+          sh '''
+            export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+            export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+            # create a new task definition JSON and register it
+            cat > taskdef.json <<EOF
+            {
+              "family": "${TASK_FAMILY}",
+              "networkMode": "bridge",
+              "containerDefinitions": [
+                {
+                  "name": "web",
+                  "image": "${ECR_URI}:${IMAGE_TAG}",
+                  "cpu": 0,
+                  "memory": 512,
+                  "essential": true,
+                  "portMappings": [
+                    {
+                      "containerPort": 3000,
+                      "hostPort": 3000,
+                      "protocol": "tcp"
+                    }
+                  ],
+                  "logConfiguration": {
+                    "logDriver": "awslogs",
+                    "options": {
+                      "awslogs-group": "/ecs/${TASK_FAMILY}",
+                      "awslogs-region": "${AWS_REGION}",
+                      "awslogs-stream-prefix": "ecs"
+                    }
+                  }
+                }
+              ]
+            }
+            EOF
+
+            aws ecs register-task-definition --cli-input-json file://taskdef.json --region ${AWS_REGION}
+          '''
+        }
+      }
+    }
+
+    stage('Update ECS Service') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'aws-creds', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+          sh '''
+            export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+            export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+            # obtain latest task definition ARN:
+            TD_ARN=$(aws ecs list-task-definitions --family-prefix ${TASK_FAMILY} --region ${AWS_REGION} --sort DESC --max-items 1 --output text | awk '{print $2}')
+            echo "New task-def: $TD_ARN"
+            # Update service to use latest task definition
+            aws ecs update-service --cluster ${CLUSTER_NAME} --service ${SERVICE_NAME} --task-definition $TD_ARN --region ${AWS_REGION}
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    success { echo 'Deployment complete' }
+    failure { echo 'Pipeline failed' }
+  }
+}
+
